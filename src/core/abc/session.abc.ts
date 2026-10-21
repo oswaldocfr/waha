@@ -114,6 +114,7 @@ import {
   GroupsListFields,
   ParticipantsRequest,
   SettingsMemberAddMode,
+  SettingsMemberShareHistoryMode,
   SettingsMembershipApproval,
   SettingsSecurityChangeInfo,
 } from '../../structures/groups.dto';
@@ -1025,6 +1026,19 @@ export abstract class WhatsappSession {
     throw new NotImplementedByEngineError();
   }
 
+  public getMemberShareHistoryMode(
+    id: string,
+  ): Promise<SettingsMemberShareHistoryMode> {
+    throw new NotImplementedByEngineError();
+  }
+
+  public setMemberShareHistoryMode(
+    id: string,
+    value: boolean,
+  ): Promise<boolean> {
+    throw new NotImplementedByEngineError();
+  }
+
   public getMembershipApprovalMode(
     id: string,
   ): Promise<SettingsMembershipApproval> {
@@ -1300,8 +1314,8 @@ export function getGroupInviteLink(code: string) {
 }
 
 export function parseGroupInviteLink(link: string) {
-  // https://chat.whatsapp.com/123 => 123
-  return link.split('/').pop();
+  // https://chat.whatsapp.com/123?s=sw&p=a => 123
+  return parseInviteCode(link);
 }
 
 export function getChannelInviteLink(code: string) {
@@ -1310,8 +1324,13 @@ export function getChannelInviteLink(code: string) {
 
 export function parseChannelInviteLink(link: string): string {
   // https://www.whatsapp.com/channel/123 => 123
-  const code = link.split('/').pop();
-  return code;
+  return parseInviteCode(link);
+}
+
+function parseInviteCode(link: string): string {
+  // last path segment, without share tracking query params and hash
+  const path = link.split(/[?#]/)[0];
+  return path.split('/').pop();
 }
 
 export function getPublicUrlFromDirectPath(directPath: string) {

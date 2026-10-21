@@ -67,6 +67,7 @@ import {
 } from '@waha/core/engines/noweb/noweb.newsletter';
 import { NowebAuthFactoryCore } from '@waha/core/engines/noweb/NowebAuthFactoryCore';
 import { NowebInMemoryStore } from '@waha/core/engines/noweb/store/NowebInMemoryStore';
+import { NoLastMessageInChatException } from '@waha/core/engines/noweb/noweb.exceptions';
 import { NotImplementedByEngineError } from '@waha/core/exceptions';
 import { toVcardV3 } from '@waha/core/vcard';
 import { createAgentProxy } from '@waha/core/helpers.proxy';
@@ -167,6 +168,7 @@ import {
   GroupParticipant,
   ParticipantsRequest,
   SettingsMemberAddMode,
+  SettingsMemberShareHistoryMode,
   SettingsMembershipApproval,
   SettingsSecurityChangeInfo,
 } from '@waha/structures/groups.dto';
@@ -1147,6 +1149,10 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     const options = {
       messageId: this.generateMessageID(),
     };
+    if (isJidNewsletter(jid)) {
+      // Newsletter deletes reuse the original message ID
+      options.messageId = key.id;
+    }
     return this.sock.sendMessage(jid, { delete: key }, options);
   }
 
@@ -1863,6 +1869,9 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
   ): Promise<any> {
     const jid = await this.hooks.wid.chat.promise(chatId, 'chatsPutArchive');
     const messages = await this.store.getMessagesByJid(jid, {}, { limit: 1 });
+    if (messages.length === 0) {
+      throw new NoLastMessageInChatException(chatId);
+    }
     return await this.sock.chatModify(
       { archive: archive, lastMessages: messages },
       jid,
@@ -1883,6 +1892,9 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
   public async chatsUnreadChat(chatId: string): Promise<any> {
     const jid = await this.hooks.wid.chat.promise(chatId, 'chatsUnreadChat');
     const messages = await this.store.getMessagesByJid(jid, {}, { limit: 1 });
+    if (messages.length === 0) {
+      throw new NoLastMessageInChatException(chatId);
+    }
     return await this.sock.chatModify(
       { markRead: false, lastMessages: messages },
       jid,
@@ -2005,6 +2017,7 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
   @Activity()
   public async upsertContact(chatId: string, body: ContactUpdateBody) {
     const jid = await this.hooks.wid.chat.promise(chatId, 'upsertContact');
+    const lid = await this.resolveContactLid(jid);
     let fullName = body.firstName;
     if (body.lastName) {
       fullName = `${body.firstName} ${body.lastName}`;
@@ -2012,16 +2025,26 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
     const action = {
       fullName: fullName,
       firstName: body.firstName,
+      lidJid: lid ?? undefined,
       saveOnPrimaryAddressbook: true,
     };
     await this.sock.addOrEditContact(jid, action);
-    const updates: Partial<Contact>[] = [
-      {
-        id: jid,
-        name: fullName,
-      },
-    ];
-    this.sock.ev.emit('contacts.update', updates);
+    const update: Partial<Contact> = {
+      id: jid,
+      name: fullName,
+    };
+    if (lid) {
+      update.lid = lid;
+    }
+    this.sock.ev.emit('contacts.update', [update]);
+  }
+
+  private async resolveContactLid(pn: string): Promise<string | null> {
+    const lid = await this.sock.signalRepository.lidMapping.getLIDForPN(pn);
+    if (!lid) {
+      return null;
+    }
+    return jidNormalizedUser(lid);
   }
 
   async getContact(query: ContactQuery) {
@@ -2214,6 +2237,23 @@ export class WhatsappSessionNoWebCore extends WhatsappSession {
   public async setMemberAddMode(id, value) {
     const mode = value ? 'all_member_add' : 'admin_add';
     return await this.sock.groupMemberAddMode(id, mode);
+  }
+
+  public async getMemberShareHistoryMode(
+    id: string,
+  ): Promise<SettingsMemberShareHistoryMode> {
+    const group = await this.getGroup(id);
+    return { membersCanShareHistory: !!group.memberShareHistoryMode };
+  }
+
+  @Activity()
+  public async setMemberShareHistoryMode(
+    id: string,
+    value: boolean,
+  ): Promise<boolean> {
+    const mode = value ? 'all_member_share' : 'admin_share';
+    await this.sock.groupMemberShareHistoryMode(id, mode);
+    return true;
   }
 
   public async getMembershipApprovalMode(
@@ -3725,6 +3765,16 @@ function hasPath(url: string) {
   }
 }
 
+// Definitive download failures - retrying would only send another re-upload receipt to the phone
+const NON_RETRIABLE_DOWNLOAD_MEDIA_STATUSES: Set<number> = new Set([
+  403, // CDN forbidden
+  404, // CDN not found / phone: NOT_FOUND
+  408, // phone did not answer the re-upload request in time
+  410, // CDN gone
+  412, // phone: DECRYPTION_ERROR
+  418, // phone: GENERAL_ERROR
+]);
+
 export class NOWEBEngineMediaProcessor implements IMediaEngineProcessor<any> {
   private readonly logger: ILogger;
 
@@ -3777,21 +3827,44 @@ export class NOWEBEngineMediaProcessor implements IMediaEngineProcessor<any> {
       content.url = null;
     }
 
+    // Baileys unwraps hydratedTemplate only, so download the interactive template header as a plain media message
+    const header = extractMessageContent(message.message)?.templateMessage
+      ?.interactiveMessageTemplate?.header;
+    if (header) {
+      message = {
+        key: message.key,
+        message: lodash.pick(header, [
+          'imageMessage',
+          'videoMessage',
+          'documentMessage',
+        ]),
+      };
+    }
+
     // Use 'stream' mode instead of 'buffer' to fix 0-byte audio files
     // 'buffer' mode silently returns empty buffer for audio/voice messages
     // See: https://github.com/devlikeapro/waha/issues/1996
-    const stream = await downloadMediaMessage(
-      message,
-      'stream',
-      {},
-      {
-        logger: this.logger,
-        reuploadRequest: this.session.sock.updateMediaMessage,
-      },
-    ).finally(() => {
+    let stream;
+    try {
+      stream = await downloadMediaMessage(
+        message,
+        'stream',
+        {},
+        {
+          logger: this.logger,
+          reuploadRequest: this.session.sock.updateMediaMessage,
+        },
+      );
+    } catch (err) {
+      if (NON_RETRIABLE_DOWNLOAD_MEDIA_STATUSES.has(err?.output?.statusCode)) {
+        // Retrying won't help and would send yet another re-upload receipt to the phone
+        err.nonRetriable = true;
+      }
+      throw err;
+    } finally {
       // Set url back in case we removed it
       content.url = url;
-    });
+    }
     const chunks: Buffer[] = [];
     for await (const chunk of stream) {
       chunks.push(chunk);
@@ -3800,8 +3873,8 @@ export class NOWEBEngineMediaProcessor implements IMediaEngineProcessor<any> {
   }
 
   getFilename(message: any): string | null {
-    const content = extractMessageContent(message.message);
-    return content?.documentMessage?.fileName || null;
+    const content = extractMediaContent(message.message);
+    return content?.fileName || null;
   }
 }
 

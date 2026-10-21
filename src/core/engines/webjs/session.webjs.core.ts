@@ -25,10 +25,6 @@ import {
   ToGroupV2UpdateEvent,
 } from '@waha/core/engines/webjs/groups.webjs';
 import {
-  TagChatstateToPresence,
-  TagPresenceToPresence,
-} from '@waha/core/engines/webjs/presence';
-import {
   WebjsChannelMessage,
   WebjsClientCore,
 } from '@waha/core/engines/webjs/WebjsClientCore';
@@ -121,6 +117,7 @@ import {
   GroupSortField,
   ParticipantsRequest,
   SettingsMemberAddMode,
+  SettingsMemberShareHistoryMode,
   SettingsMembershipApproval,
   SettingsSecurityChangeInfo,
 } from '@waha/structures/groups.dto';
@@ -208,7 +205,11 @@ import {
 } from 'whatsapp-web.js/src/structures';
 import { GetSerialized } from '@waha/core/utils/serialized';
 
-import { WAJSPresenceChatStateType, WebJSPresence } from './types';
+import {
+  WAJSPresenceChatStateType,
+  WebJSPresence,
+  WebJSPresenceUpdate,
+} from './types';
 import { WebJSAuthFactory } from './WebJSAuthFactory';
 import {
   isJidCus,
@@ -351,7 +352,7 @@ export class WhatsappSessionWebJSCore extends WhatsappSession {
 
   protected getWebjsTagsFlag() {
     // Emit 'tag:*' events only when explicitly enabled in session config.
-    // This flag is required for presence.update and message.ack events.
+    // This flag is required for message.ack events.
     // Disabled by default for performance and stability reasons.
     return !!this.sessionConfig?.webjs?.tagsEventsOn;
   }
@@ -683,22 +684,6 @@ export class WhatsappSessionWebJSCore extends WhatsappSession {
     this.whatsapp.on(Events.READY, () => {
       this.qr.save('');
       this.logger.info(`Session '${this.name}' is ready!`);
-    });
-
-    //
-    // Temp fix for hiding "Fresh look" modal
-    // https://github.com/devlikeapro/waha/issues/987
-    //
-    this.whatsapp.on(Events.READY, async () => {
-      try {
-        const hidden = await this.whatsapp.hideUXFreshLook();
-        if (hidden) {
-          this.logger.info('"Fresh look" modal has been hidden');
-        }
-      } catch (err) {
-        this.logger.warn('Failed to hide "Fresh look" modal');
-        this.logger.warn(err, err.stack);
-      }
     });
 
     this.whatsapp.on(Events.AUTHENTICATED, async (args) => {
@@ -1757,6 +1742,28 @@ export class WhatsappSessionWebJSCore extends WhatsappSession {
     return groupChat.setAddMembersAdminsOnly(!value);
   }
 
+  public async getMemberShareHistoryMode(
+    id: string,
+  ): Promise<SettingsMemberShareHistoryMode> {
+    const groupChat = (await this.whatsapp.getChatById(id)) as GroupChat;
+    return {
+      membersCanShareHistory:
+        // @ts-ignore
+        groupChat.groupMetadata.memberShareGroupHistoryMode ===
+        'all_member_share',
+    };
+  }
+
+  @Activity()
+  public async setMemberShareHistoryMode(
+    id: string,
+    value: boolean,
+  ): Promise<boolean> {
+    const groupChat = (await this.whatsapp.getChatById(id)) as GroupChat;
+    // The library setter is inverted - it takes "adminsOnly"
+    return groupChat.setShareHistoryAdminsOnly(!value);
+  }
+
   @Activity()
   public async getMembershipApprovalMode(
     id: string,
@@ -2504,19 +2511,15 @@ export class WhatsappSessionWebJSCore extends WhatsappSession {
     //
     // Presence
     //
-    const tagPresenceNode$ = fromEvent(this.whatsapp, Events.TAG_PRESENCE);
-    const presences$ = tagPresenceNode$.pipe(
-      map(TagPresenceToPresence),
-      filter(Boolean),
-      filter((presence: any) => this.jids.include(presence.id)),
+    const presenceUpdate$ = fromEvent(
+      this.whatsapp.events,
+      'presence.update',
+    ).pipe(
+      map((data: WebJSPresenceUpdate) =>
+        this.toWahaPresences(data.id, data.presences),
+      ),
+      filter((presence) => this.jids.include(presence.id)),
     );
-    const tagChatstateNode$ = fromEvent(this.whatsapp, 'tag:chatstate');
-    const chatstatePresences$ = tagChatstateNode$.pipe(
-      map(TagChatstateToPresence),
-      filter(Boolean),
-      filter((presence: any) => this.jids.include(presence.id)),
-    );
-    const presenceUpdate$ = merge(presences$, chatstatePresences$);
     this.events2.get(WAHAEvents.PRESENCE_UPDATE).switch(presenceUpdate$);
 
     //

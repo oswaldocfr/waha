@@ -5,6 +5,7 @@ import {
   IsArray,
   IsBoolean,
   IsEnum,
+  IsNotEmpty,
   IsOptional,
   IsString,
 } from 'class-validator';
@@ -28,6 +29,11 @@ export class SettingsSecurityChangeInfo {
 
 export class SettingsMemberAddMode {
   membersCanAddNewMember: boolean = true;
+}
+
+export class SettingsMemberShareHistoryMode {
+  @IsBoolean()
+  membersCanShareHistory: boolean = true;
 }
 
 export class SettingsMembershipApproval {
@@ -146,6 +152,7 @@ export class DescriptionRequest {
 
 export class SubjectRequest {
   @IsString()
+  @IsNotEmpty()
   subject: string;
 }
 
